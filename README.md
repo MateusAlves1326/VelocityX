@@ -153,8 +153,14 @@ O teste segue estágios progressivos:
 
 ### 7.2 Ping
 
-- O app executa requisições leves e mede o tempo de ida/volta.
+- O app usa a API publica da Cloudflare em `https://speed.cloudflare.com/cdn-cgi/trace` para medir o tempo de ida/volta.
 - O valor final usa média aparada (trimmed average), reduzindo impacto de extremos.
+
+### 7.4 Endpoints Cloudflare usados
+
+- `https://speed.cloudflare.com/cdn-cgi/trace` para latencia (ping) e metadados do PoP (colo).
+- `https://speed.cloudflare.com/__down` para estimativa de download.
+- `https://speed.cloudflare.com/__up` para estimativa de upload.
 
 ### 7.3 Estabilidade
 

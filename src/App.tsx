@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { jsPDF } from 'jspdf'
 import autoTable from 'jspdf-autotable'
 import * as XLSX from 'xlsx'
@@ -30,8 +30,24 @@ type HistoryEntry = {
   adequacyPercent: number | null
 }
 
+type CloudflareMeta = {
+  ip: string | null
+  colo: string | null
+}
+
 const CF_BASE = 'https://speed.cloudflare.com'
 const HISTORY_STORAGE_KEY = 'speedtest-history-v1'
+const SCHEDULE_STORAGE_KEY = 'speedtest-schedule-v1'
+const SPEEDOMETER_MAX_MBPS = 1000
+
+type PersistedSchedule = {
+  enabled: boolean
+  startAt: number
+  endAt: number
+  nextRunAt: number | null
+  scheduledRuns: number
+  intervalMs: number
+}
 
 const readHistoryFromStorage = (): HistoryEntry[] => {
   try {
@@ -51,8 +67,71 @@ const readHistoryFromStorage = (): HistoryEntry[] => {
   }
 }
 
+const readScheduleFromStorage = (): PersistedSchedule | null => {
+  try {
+    const raw = localStorage.getItem(SCHEDULE_STORAGE_KEY)
+    if (!raw) {
+      return null
+    }
+
+    const parsed = JSON.parse(raw) as Partial<PersistedSchedule>
+    if (
+      typeof parsed.enabled !== 'boolean' ||
+      typeof parsed.startAt !== 'number' ||
+      typeof parsed.endAt !== 'number' ||
+      typeof parsed.scheduledRuns !== 'number' ||
+      typeof parsed.intervalMs !== 'number'
+    ) {
+      return null
+    }
+
+    if (parsed.nextRunAt !== null && typeof parsed.nextRunAt !== 'number') {
+      return null
+    }
+
+    return {
+      enabled: parsed.enabled,
+      startAt: parsed.startAt,
+      endAt: parsed.endAt,
+      nextRunAt: parsed.nextRunAt ?? null,
+      scheduledRuns: parsed.scheduledRuns,
+      intervalMs: parsed.intervalMs,
+    }
+  } catch {
+    return null
+  }
+}
+
 const formatDateTime = (isoDate: string) =>
   new Date(isoDate).toLocaleString('pt-BR')
+
+const formatTimestamp = (timestamp: number) =>
+  new Date(timestamp).toLocaleString('pt-BR')
+
+// Extrai pares chave=valor retornados pelo endpoint /cdn-cgi/trace.
+const parseTraceResponse = (raw: string): CloudflareMeta => {
+  const result: CloudflareMeta = {
+    ip: null,
+    colo: null,
+  }
+
+  for (const line of raw.split('\n')) {
+    const [key, value] = line.split('=')
+    if (!key || !value) {
+      continue
+    }
+
+    if (key === 'ip') {
+      result.ip = value.trim()
+    }
+
+    if (key === 'colo') {
+      result.colo = value.trim()
+    }
+  }
+
+  return result
+}
 
 // Formata numeros com uma casa decimal para exibir resultados no painel.
 const formatNumber = (value: number) => value.toFixed(1)
@@ -290,6 +369,63 @@ const buildLinePoints = (
     .join(' ')
 }
 
+// Exibe o progresso do teste como velocimetro semicircular.
+function Speedometer({
+  progress,
+  activeStep,
+  totalSteps,
+  speedMbps,
+  maxGaugeMbps,
+}: {
+  progress: number
+  activeStep: number
+  totalSteps: number
+  speedMbps: number | null
+  maxGaugeMbps: number
+}) {
+  const clampedProgress = Math.max(0, Math.min(100, progress))
+  const currentSpeed = Math.max(0, speedMbps ?? 0)
+  const clampedSpeed = Math.min(currentSpeed, maxGaugeMbps)
+  const angle = -120 + (clampedSpeed / maxGaugeMbps) * 240
+  const ticks = [0, 0.25, 0.5, 0.75, 1]
+  const speedLabel =
+    speedMbps === null
+      ? '--'
+      : speedMbps >= 1
+        ? `${formatNumber(speedMbps)} Mbps`
+        : `${formatNumber(speedMbps * 1_000)} kbps`
+
+  return (
+    <div className="speedometer" role="img" aria-label={`Velocidade atual ${speedLabel}`}>
+      <div className="speedometer-dial">
+        {ticks.map((ratio) => {
+          const tickAngle = -120 + ratio * 240
+          const labelValue = Math.round(maxGaugeMbps * ratio)
+
+          return (
+            <div
+              key={`tick-${ratio}`}
+              className="speedometer-tick"
+              style={{ transform: `translateX(-50%) rotate(${tickAngle}deg)` }}
+            >
+              <span style={{ transform: `rotate(${-tickAngle}deg)` }}>{labelValue}</span>
+            </div>
+          )
+        })}
+        <span className="speedometer-needle" style={{ transform: `translateX(-50%) rotate(${angle}deg)` }}></span>
+        <div className="speedometer-core"></div>
+      </div>
+      <div className="speedometer-readout">
+        <strong>{speedLabel}</strong>
+        <span>Escala 0 a {Math.round(maxGaugeMbps)} Mbps</span>
+        <small>
+          Etapa {Math.min(activeStep + 1, totalSteps)}/{totalSteps} • {Math.round(clampedProgress)}%
+        </small>
+      </div>
+    </div>
+  )
+}
+
 // Componente de grafico de linha com hover e tooltip em cada amostra.
 function LineChart({
   title,
@@ -390,6 +526,12 @@ function LineChart({
 
 // Componente principal com estados, fluxo do teste e renderizacao da interface.
 function App() {
+  const persistedSchedule = readScheduleFromStorage()
+  const persistedScheduleIsValid =
+    persistedSchedule?.enabled === true &&
+    persistedSchedule.endAt > new Date().getTime()
+  const initialSchedule = persistedScheduleIsValid ? persistedSchedule : null
+
   const [status, setStatus] = useState('Pronto para testar sua velocidade')
   const [running, setRunning] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -399,10 +541,52 @@ function App() {
   const [activeStep, setActiveStep] = useState<number>(0)
   const [history, setHistory] = useState<HistoryEntry[]>(() => readHistoryFromStorage())
   const [currentSpeed, setCurrentSpeed] = useState<number | null>(null)
+  const [cfMeta, setCfMeta] = useState<CloudflareMeta>({ ip: null, colo: null })
+  const [scheduleDurationHours, setScheduleDurationHours] = useState('12')
+  const [scheduleIntervalHours, setScheduleIntervalHours] = useState('1')
+  const [scheduleEnabled, setScheduleEnabled] = useState(Boolean(initialSchedule))
+  const [scheduleStartAt, setScheduleStartAt] = useState<number | null>(
+    initialSchedule?.startAt ?? null,
+  )
+  const [scheduleEndAt, setScheduleEndAt] = useState<number | null>(
+    initialSchedule?.endAt ?? null,
+  )
+  const [scheduleNextRunAt, setScheduleNextRunAt] = useState<number | null>(
+    initialSchedule?.nextRunAt ?? null,
+  )
+  const [scheduledRuns, setScheduledRuns] = useState(initialSchedule?.scheduledRuns ?? 0)
+
+  const runningRef = useRef(false)
+  const scheduleTimerRef = useRef<number | null>(null)
+  const runTestRef = useRef<
+    ((source?: 'manual' | 'scheduled') => Promise<boolean>) | null
+  >(null)
+  const armScheduledRunRef = useRef<((runAt: number) => void) | null>(null)
+  const scheduleConfigRef = useRef<{ endAt: number; intervalMs: number } | null>(
+    initialSchedule
+      ? {
+          endAt: initialSchedule.endAt,
+          intervalMs: initialSchedule.intervalMs,
+        }
+      : null,
+  )
+  const restoredScheduleArmedRef = useRef(false)
 
   useEffect(() => {
     localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(history))
   }, [history])
+
+  useEffect(() => {
+    runningRef.current = running
+  }, [running])
+
+  useEffect(() => {
+    return () => {
+      if (scheduleTimerRef.current !== null) {
+        window.clearTimeout(scheduleTimerRef.current)
+      }
+    }
+  }, [])
 
   const planMbps = useMemo(() => parsePlanToMbps(planInput), [planInput])
   const adequacy = useMemo(() => {
@@ -428,6 +612,8 @@ function App() {
 
     return 'Não. Sua internet está bem abaixo do plano informado.'
   }, [adequacy])
+
+  const maxGaugeMbps = SPEEDOMETER_MAX_MBPS
 
   const getHistoryRowsForExport = () => {
     return history.map((entry) => ({
@@ -494,8 +680,90 @@ function App() {
     }
   }
 
+  const stopScheduledTests = useCallback((nextStatus?: string) => {
+    if (scheduleTimerRef.current !== null) {
+      window.clearTimeout(scheduleTimerRef.current)
+      scheduleTimerRef.current = null
+    }
+
+    scheduleConfigRef.current = null
+    setScheduleEnabled(false)
+    setScheduleNextRunAt(null)
+
+    if (nextStatus) {
+      setStatus(nextStatus)
+    }
+  }, [])
+
+  const armScheduledRun = useCallback((runAt: number) => {
+    const config = scheduleConfigRef.current
+    if (!config) {
+      return
+    }
+
+    if (runAt > config.endAt) {
+      stopScheduledTests('Agendamento concluido com sucesso.')
+      return
+    }
+
+    setScheduleNextRunAt(runAt)
+
+    if (scheduleTimerRef.current !== null) {
+      window.clearTimeout(scheduleTimerRef.current)
+      scheduleTimerRef.current = null
+    }
+
+    const waitMs = Math.max(0, runAt - new Date().getTime())
+
+    scheduleTimerRef.current = window.setTimeout(async () => {
+      const currentConfig = scheduleConfigRef.current
+      if (!currentConfig) {
+        return
+      }
+
+      if (runAt > currentConfig.endAt) {
+        stopScheduledTests('Janela do agendamento encerrada.')
+        return
+      }
+
+      const nextRunAt = runAt + currentConfig.intervalMs
+
+      if (runningRef.current) {
+        // Se houver teste em andamento, adia para manter execucao sem sobreposicao.
+        armScheduledRunRef.current?.(nextRunAt)
+        return
+      }
+
+      const didRun = await runTestRef.current?.('scheduled')
+      if (!didRun) {
+        armScheduledRunRef.current?.(nextRunAt)
+        return
+      }
+
+      armScheduledRunRef.current?.(nextRunAt)
+    }, waitMs)
+  }, [stopScheduledTests])
+
+  useEffect(() => {
+    armScheduledRunRef.current = armScheduledRun
+  })
+
+  const queueNextScheduledRun = useCallback((fromTimestamp: number) => {
+    const config = scheduleConfigRef.current
+    if (!config) {
+      return
+    }
+
+    const nextRunAt = fromTimestamp + config.intervalMs
+    armScheduledRun(nextRunAt)
+  }, [armScheduledRun])
+
   // Executa o teste completo em etapas: preparo, ping, download, upload e analise.
-  const runTest = async () => {
+  const runTest = async (source: 'manual' | 'scheduled' = 'manual') => {
+    if (runningRef.current) {
+      return false
+    }
+
     setRunning(true)
     setError(null)
     setResult(null)
@@ -508,6 +776,15 @@ function App() {
 
       setStatus('Preparando ambiente de teste...')
       setProgress(2)
+      const traceResponse = await fetch(`${CF_BASE}/cdn-cgi/trace?ts=${Date.now()}`, {
+        cache: 'no-store',
+      })
+
+      if (traceResponse.ok) {
+        const traceText = await traceResponse.text()
+        setCfMeta(parseTraceResponse(traceText))
+      }
+
       await delay(2_500)
 
       setActiveStep(1)
@@ -527,7 +804,7 @@ function App() {
         setStatus(`Medindo ping... amostra ${i + 1} de ${pingAttempts}`)
         const start = performance.now()
         const response = await fetch(
-          `${CF_BASE}/__down?bytes=32&ts=${Date.now()}-${i}`,
+          `${CF_BASE}/cdn-cgi/trace?ts=${Date.now()}-${i}`,
           {
             cache: 'no-store',
           },
@@ -633,8 +910,114 @@ function App() {
       setStatus('Falha no teste')
     } finally {
       setRunning(false)
+      if (source === 'scheduled') {
+        setScheduledRuns((previous) => previous + 1)
+      }
     }
+
+    return true
   }
+
+  useEffect(() => {
+    runTestRef.current = runTest
+  })
+
+  const startScheduledTests = async () => {
+    if (runningRef.current) {
+      setError('Aguarde o teste atual terminar para iniciar o agendamento.')
+      return
+    }
+
+    const durationHours = Number(scheduleDurationHours.replace(',', '.'))
+    const intervalHours = Number(scheduleIntervalHours.replace(',', '.'))
+
+    if (!Number.isFinite(durationHours) || durationHours <= 0) {
+      setError('Informe uma duracao total valida em horas.')
+      return
+    }
+
+    if (!Number.isFinite(intervalHours) || intervalHours <= 0) {
+      setError('Informe um intervalo valido em horas.')
+      return
+    }
+
+    const startAt = Date.now()
+    const endAt = startAt + durationHours * 3_600_000
+    const intervalMs = intervalHours * 3_600_000
+
+    setError(null)
+    setScheduleEnabled(true)
+    setScheduleStartAt(startAt)
+    setScheduleEndAt(endAt)
+    setScheduleNextRunAt(null)
+    setScheduledRuns(0)
+    scheduleConfigRef.current = { endAt, intervalMs }
+    setStatus('Agendamento automatico iniciado.')
+
+    const didRun = await runTest('scheduled')
+    if (!didRun) {
+      stopScheduledTests('Nao foi possivel iniciar o teste automatico.')
+      return
+    }
+
+    queueNextScheduledRun(startAt)
+  }
+
+  useEffect(() => {
+    const config = scheduleConfigRef.current
+
+    if (!scheduleEnabled || !config || !scheduleStartAt || !scheduleEndAt) {
+      localStorage.removeItem(SCHEDULE_STORAGE_KEY)
+      return
+    }
+
+    const payload: PersistedSchedule = {
+      enabled: scheduleEnabled,
+      startAt: scheduleStartAt,
+      endAt: scheduleEndAt,
+      nextRunAt: scheduleNextRunAt,
+      scheduledRuns,
+      intervalMs: config.intervalMs,
+    }
+
+    localStorage.setItem(SCHEDULE_STORAGE_KEY, JSON.stringify(payload))
+  }, [
+    scheduleEnabled,
+    scheduleStartAt,
+    scheduleEndAt,
+    scheduleNextRunAt,
+    scheduledRuns,
+  ])
+
+  useEffect(() => {
+    if (restoredScheduleArmedRef.current) {
+      return
+    }
+
+    restoredScheduleArmedRef.current = true
+
+    const config = scheduleConfigRef.current
+    if (!scheduleEnabled || !config || !scheduleEndAt) {
+      return
+    }
+
+    const now = new Date().getTime()
+    if (now >= scheduleEndAt) {
+      localStorage.removeItem(SCHEDULE_STORAGE_KEY)
+      return
+    }
+
+    const recoveredRunAt =
+      scheduleNextRunAt && scheduleNextRunAt > now ? scheduleNextRunAt : now
+
+    armScheduledRun(recoveredRunAt)
+  }, [
+    armScheduledRun,
+    scheduleEnabled,
+    scheduleEndAt,
+    scheduleNextRunAt,
+    stopScheduledTests,
+  ])
 
   return (
     <main className="app-shell">
@@ -651,9 +1034,14 @@ function App() {
         <div className="board-head">
           <span className={`dot ${running ? 'running' : 'idle'}`}></span>
           <strong>{status}</strong>
+          {(cfMeta.ip || cfMeta.colo) && (
+            <small>
+              Cloudflare {cfMeta.colo ? `(${cfMeta.colo})` : ''} {cfMeta.ip ? `- ${cfMeta.ip}` : ''}
+            </small>
+          )}
         </div>
 
-        <button className="primary" onClick={runTest} disabled={running}>
+        <button className="primary" onClick={() => void runTest('manual')} disabled={running}>
           <span className="primary-label">
             <img
               src="/sync.svg"
@@ -669,17 +1057,14 @@ function App() {
           <div className="progress-labels">
             <span>Progresso do teste</span>
             <strong>{Math.round(progress)}%</strong>
-            {currentSpeed !== null && (
-              <span className="current-speed">
-                {currentSpeed >= 1
-                  ? `${formatNumber(currentSpeed)} Mbps`
-                  : `${formatNumber(currentSpeed * 1_000)} kbps`}
-              </span>
-            )}
           </div>
-          <div className="progress-track" aria-hidden="true">
-            <div className="progress-fill" style={{ width: `${progress}%` }}></div>
-          </div>
+          <Speedometer
+            progress={progress}
+            activeStep={activeStep}
+            totalSteps={TEST_STEPS.length}
+            speedMbps={currentSpeed}
+            maxGaugeMbps={maxGaugeMbps}
+          />
           <div className="step-list">
             {TEST_STEPS.map((step, index) => (
               <span
@@ -779,6 +1164,69 @@ function App() {
             </p>
           ) : null}
         </div>
+
+        <section className="schedule-box" aria-live="polite">
+          <h2>Agendamento automatico de testes</h2>
+          <p className="schedule-help">
+            Defina a duracao total do monitoramento, em horas, e o intervalo,
+            tambem em horas, para a execucao de novos testes. Exemplo para
+            amanha: duracao de 12h e intervalo de 1h. E necessario manter esta
+            aba aberta durante todo o periodo configurado.
+          </p>
+
+          <div className="schedule-grid">
+            <label htmlFor="schedule-duration">Duracao total (horas)</label>
+            <input
+              id="schedule-duration"
+              type="number"
+              min="0.5"
+              step="0.5"
+              value={scheduleDurationHours}
+              onChange={(event) => setScheduleDurationHours(event.target.value)}
+              disabled={scheduleEnabled}
+            />
+
+            <label htmlFor="schedule-interval">Executar a cada (horas)</label>
+            <input
+              id="schedule-interval"
+              type="number"
+              min="0.5"
+              step="0.5"
+              value={scheduleIntervalHours}
+              onChange={(event) => setScheduleIntervalHours(event.target.value)}
+              disabled={scheduleEnabled}
+            />
+          </div>
+
+          <div className="schedule-actions">
+            <button
+              className="history-export"
+              onClick={() => void startScheduledTests()}
+              disabled={scheduleEnabled || running}
+            >
+              Iniciar agendamento
+            </button>
+            <button
+              className="history-clear"
+              onClick={() => stopScheduledTests('Agendamento interrompido pelo usuario.')}
+              disabled={!scheduleEnabled}
+            >
+              Parar agendamento
+            </button>
+          </div>
+
+          <p className="schedule-status">
+            {scheduleEnabled
+              ? `Agendamento ativo • Iniciado em ${
+                  scheduleStartAt ? formatTimestamp(scheduleStartAt) : '-'
+                } • Termina em ${
+                  scheduleEndAt ? formatTimestamp(scheduleEndAt) : '-'
+                } • Proximo teste em ${
+                  scheduleNextRunAt ? formatTimestamp(scheduleNextRunAt) : 'calculando...'
+                } • Testes executados: ${scheduledRuns}`
+              : 'Agendamento inativo.'}
+          </p>
+        </section>
 
         <section className="history-box" aria-live="polite">
           <div className="history-head">
